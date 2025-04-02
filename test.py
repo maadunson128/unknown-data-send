@@ -6,34 +6,51 @@ import pytz
 import ssl
 import argparse
 import os
+import logging
+import sys
+from logging.handlers import RotatingFileHandler
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
 
-# MQTT Configuration
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler("tank_monitor.log", maxBytes=10485760, backupCount=5),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("tank_monitor")
+
+# MQTT Configuration from environment variables
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "f449892e7b6e4850ae929bf1e722fef1.s1.eu.hivemq.cloud")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", 8883))
 MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "maadunson128")
 MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "Ipradeep@1")
 
 # MQTT Topics
-topic1 = "tank/topic1"  # Left Tank (Girls) level (cm)
-topic2 = "tank/topic2"  # Left Tank (Girls) volume (liters)
-topic3 = "tank/topic3"  # Right Tank (Boys) level (cm)
-topic4 = "tank/topic4"  # Right Tank (Boys) volume (liters)
-topic5 = "tank/topic5"  # Timestamp (IST)
-lwt_topic = "tank/status"  # LWT topic
-lwt_message = "Offline"  # LWT message
+topic1 = os.environ.get("TOPIC1", "tank/topic1")  # Left Tank (Girls) level (cm)
+topic2 = os.environ.get("TOPIC2", "tank/topic2")  # Left Tank (Girls) volume (liters)
+topic3 = os.environ.get("TOPIC3", "tank/topic3")  # Right Tank (Boys) level (cm)
+topic4 = os.environ.get("TOPIC4", "tank/topic4")  # Right Tank (Boys) volume (liters)
+topic5 = os.environ.get("TOPIC5", "tank/topic5")  # Timestamp (IST)
+lwt_topic = os.environ.get("LWT_TOPIC", "tank/status")  # LWT topic
+lwt_message = os.environ.get("LWT_MESSAGE", "Offline")  # LWT message
 
 # Tank Properties
-TANK_AREA_CM2 = 91628.57  # Cross-sectional area of both tanks (cm²)
-MAX_LEVEL_CM = 140  # Max water level (cm)
-MIN_LEVEL_CM = 2    # Min water level (cm)
-REFILL_DURATION = 55   # Minutes to refill both tanks (1 hour)
+TANK_AREA_CM2 = float(os.environ.get("TANK_AREA_CM2", 91628.57))  # Cross-sectional area of both tanks (cm²)
+MAX_LEVEL_CM = float(os.environ.get("MAX_LEVEL_CM", 140))  # Max water level (cm)
+MIN_LEVEL_CM = float(os.environ.get("MIN_LEVEL_CM", 2))    # Min water level (cm)
+REFILL_DURATION = int(os.environ.get("REFILL_DURATION", 55))   # Minutes to refill both tanks
 
 # Initial simulation time (will be set from command line or default to current time)
 simulation_time = None
 
 # Initial Water Levels
-left_tank_level = 80  # Girls tank starting level
-right_tank_level = 75  # Boys tank starting level
+left_tank_level = float(os.environ.get("INITIAL_LEFT_LEVEL", 80))  # Girls tank starting level
+right_tank_level = float(os.environ.get("INITIAL_RIGHT_LEVEL", 75))  # Boys tank starting level
 
 # Shared refill state tracking for both tanks
 tanks_refilling = False
@@ -92,6 +109,69 @@ WATER_PER_USE = {
 
 # IST Timezone
 IST = pytz.timezone("Asia/Kolkata")
+
+# Web server status data - updated by the main process
+status_data = {
+    "status": "starting",
+    "last_update": None,
+    "mqtt_connected": False,
+    "error": None
+}
+
+# HTTP Handler for web interface
+class StatusHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        global left_tank_level, right_tank_level, simulation_time, tanks_refilling
+        
+        if self.path == '/health' or self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            
+            # Create status report
+            status = {
+                "status": status_data["status"],
+                "timestamp": datetime.datetime.now(IST).isoformat(),
+                "simulation_time": simulation_time.isoformat() if simulation_time else None,
+                "mqtt_connected": status_data["mqtt_connected"],
+                "last_update": status_data["last_update"],
+                "tanks": {
+                    "left": {
+                        "level_cm": round(left_tank_level, 2),
+                        "volume_liters": round(calculate_volume(left_tank_level), 2)
+                    },
+                    "right": {
+                        "level_cm": round(right_tank_level, 2),
+                        "volume_liters": round(calculate_volume(right_tank_level), 2)
+                    }
+                },
+                "refilling": tanks_refilling,
+                "current_period": get_current_break_period(datetime.datetime.now(IST)),
+                "render_deployment_time": "2025-04-02 17:16:10"
+            }
+            
+            # Add any error information
+            if status_data["error"]:
+                status["error"] = status_data["error"]
+            
+            self.wfile.write(json.dumps(status, indent=2).encode())
+        else:
+            self.send_response(404)
+            self.send_header('Content-type', 'text/plain')
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+    
+    def log_message(self, format, *args):
+        # Redirect server logs to our logger
+        if args[1] != '/health':  # Don't log health check requests to reduce noise
+            logger.info(f"HTTP: {args[0]} {args[1]} {args[2]}")
+
+def start_web_server():
+    """Start the web server in a separate thread."""
+    port = int(os.environ.get('PORT', 10000))
+    server = HTTPServer(('0.0.0.0', port), StatusHandler)
+    logger.info(f"Starting web server on port {port}")
+    server.serve_forever()
 
 def calculate_volume(level_cm):
     """Calculate water volume in liters."""
@@ -312,9 +392,9 @@ def check_and_handle_refill(current_time):
         if refill_window and last_refill_day != current_day:
             # Randomly decide if we start refill now - creates variation in start times within window
             if random.random() < 0.3:  # 30% chance to start if conditions are met
-                print(f"Starting simultaneous refill for both tanks at {current_time.strftime('%H:%M:%S')}")
-                print(f"Left Tank starting level: {left_tank_level:.2f} cm")
-                print(f"Right Tank starting level: {right_tank_level:.2f} cm")
+                logger.info(f"Starting simultaneous refill for both tanks at {current_time.strftime('%H:%M:%S')}")
+                logger.info(f"Left Tank starting level: {left_tank_level:.2f} cm")
+                logger.info(f"Right Tank starting level: {right_tank_level:.2f} cm")
                 
                 # Save start levels for both tanks
                 left_refill_start_level = left_tank_level
@@ -335,7 +415,7 @@ def check_and_handle_refill(current_time):
         
         if elapsed_minutes >= REFILL_DURATION:
             # Refill completed
-            print(f"Refill completed for both tanks at {current_time.strftime('%H:%M:%S')}")
+            logger.info(f"Refill completed for both tanks at {current_time.strftime('%H:%M:%S')}")
             tanks_refilling = False
             refill_start_time = None
             return False
@@ -354,19 +434,40 @@ def check_and_handle_refill(current_time):
         right_level_increase = right_level_increase * shared_random_factor
         right_tank_level = min(right_refill_start_level + right_level_increase, MAX_LEVEL_CM)
         
-        # Print status occasionally to avoid cluttering the output
+        # Log status occasionally to avoid cluttering the output
         if int(elapsed_minutes) % 10 == 0 and int(elapsed_minutes) > 0:
-            print(f"Both tanks refilling: {int(elapsed_minutes)}/{REFILL_DURATION} minutes")
-            print(f"Left Tank level: {left_tank_level:.2f} cm")
-            print(f"Right Tank level: {right_tank_level:.2f} cm")
+            logger.info(f"Both tanks refilling: {int(elapsed_minutes)}/{REFILL_DURATION} minutes")
+            logger.info(f"Left Tank level: {left_tank_level:.2f} cm")
+            logger.info(f"Right Tank level: {right_tank_level:.2f} cm")
         
         return True
 
 def on_connect(client, userdata, flags, reason_code, properties):
+    global status_data
     if reason_code == 0:
-        print("Connected to MQTT Broker!")
+        logger.info("Connected to MQTT Broker!")
+        status_data["mqtt_connected"] = True
+        # Publish online status
+        try:
+            client.publish(lwt_topic, "Online", qos=1, retain=True)
+        except Exception as e:
+            logger.error(f"Failed to publish online status: {str(e)}")
     else:
-        print(f"Failed to connect, return code {reason_code}")
+        logger.error(f"Failed to connect, return code {reason_code}")
+        status_data["mqtt_connected"] = False
+        status_data["error"] = f"MQTT connection failed with code {reason_code}"
+        # The client will auto-reconnect by default
+
+def on_disconnect(client, userdata, rc, properties):
+    global status_data
+    status_data["mqtt_connected"] = False
+    logger.warning(f"Disconnected with result code {rc}")
+    if rc != 0:
+        logger.info("Unexpected disconnect. Reconnection will be handled automatically.")
+
+def on_publish(client, userdata, mid, properties):
+    # Optionally track successful publishes
+    pass
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Water Tank Monitoring Simulation")
@@ -375,7 +476,10 @@ def parse_args():
     return parser.parse_args()
 
 def main():
-    global simulation_time, left_tank_level, right_tank_level
+    global simulation_time, left_tank_level, right_tank_level, status_data
+    
+    # Update status
+    status_data["status"] = "initializing"
     
     # Parse command line arguments
     args = parse_args()
@@ -385,17 +489,23 @@ def main():
         try:
             utc_time = datetime.datetime.strptime(args.start_time, "%Y-%m-%d %H:%M:%S")
             simulation_time = pytz.utc.localize(utc_time).astimezone(IST)
-            print(f"Starting simulation at: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
+            logger.info(f"Starting simulation at: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
         except ValueError:
-            print(f"Invalid time format. Using current time.")
+            logger.warning(f"Invalid time format. Using current time.")
             simulation_time = datetime.datetime.now(IST)
     else:
         # Use current time in IST
         simulation_time = datetime.datetime.now(IST)
-        print(f"Starting simulation at current time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
+        logger.info(f"Starting simulation at current time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
     
-    # Set up MQTT client with VERSION2 API
-    client = mqtt.Client(client_id="ESP32_TankMonitor", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    # Start web server in a separate thread
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+    logger.info("Web server thread started")
+    
+    # Set up MQTT client with VERSION2 API and random client ID to avoid connection conflicts
+    client_id = f"ESP32_TankMonitor_{random.randint(1000, 9999)}"
+    client = mqtt.Client(client_id=client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
 
     # Use system certificates
@@ -404,11 +514,38 @@ def main():
     # Last Will and Testament (LWT)
     client.will_set(lwt_topic, lwt_message, qos=1, retain=True)
 
-    # On connect callback
+    # Set callbacks
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_publish = on_publish
 
-    # Connect to MQTT broker
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    # Connect to MQTT broker with retry logic
+    connected = False
+    retry_count = 0
+    max_retries = 10
+    
+    while not connected and retry_count < max_retries:
+        try:
+            logger.info(f"Attempting to connect to MQTT broker (attempt {retry_count+1})")
+            client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            connected = True
+            status_data["mqtt_connected"] = True
+            logger.info(f"Successfully connected to MQTT broker with client ID: {client_id}")
+        except Exception as e:
+            retry_count += 1
+            status_data["error"] = f"MQTT connection attempt {retry_count} failed: {str(e)}"
+            logger.error(f"Connection attempt {retry_count} failed: {str(e)}")
+            if retry_count < max_retries:
+                wait_time = min(30, 2 ** retry_count)  # Exponential backoff
+                logger.info(f"Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time)
+    
+    if not connected:
+        status_data["status"] = "error"
+        status_data["error"] = "Failed to connect to MQTT broker after maximum retries"
+        logger.critical("Failed to connect after maximum retries. Will continue running for web interface.")
+    else:
+        status_data["status"] = "connected"
 
     # Start the client loop in the background
     client.loop_start()
@@ -418,95 +555,149 @@ def main():
     
     # Start simulation
     try:
-        print("Starting realistic tank monitoring simulation. Press CTRL+C to exit.")
-        print(f"Current time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(simulation_time) else 'Weekend'}")
+        logger.info("Starting realistic tank monitoring simulation")
+        logger.info(f"Current time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(simulation_time) else 'Weekend'}")
         
         # Show initial usage variations for all periods
-        print("\nInitial usage variations:")
+        logger.info("Initial usage variations:")
         for period, genders in current_usage_variations.items():
-            print(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
+            logger.info(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
         
         last_day = simulation_time.day
         update_counter = 0
+        health_check_counter = 0
+        
+        # Update status
+        status_data["status"] = "running"
         
         while True:
-            # Advance simulation time by 3 minutes
-            # Get current time in IST for live simulation
-            simulation_time = datetime.datetime.now(IST)
-            update_counter += 1
-            
-            # Check if we've moved to a new day
-            if simulation_time.day != last_day:
-                last_day = simulation_time.day
-                print(f"\nNew day: {simulation_time.strftime('%Y-%m-%d')}")
-            
-            # Get current break period
-            current_break = get_current_break_period(simulation_time)
-            
-            # Update all usage variations every 3 minutes
-            old_variations = current_usage_variations.copy() if current_usage_variations else None
-            update_all_usage_variations()
-            
-            # Print significant variation changes every few updates to avoid cluttering
-            if update_counter % 5 == 0:
-                print("\nUpdated usage variations:")
-                for period, genders in current_usage_variations.items():
-                    print(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
-            
-            # Handle shared refill for both tanks
-            is_refilling = check_and_handle_refill(simulation_time)
-            
-            if not is_refilling:
-                # If not refilling, calculate consumption for both tanks
-                left_consumption = calculate_consumption("girls", current_break, simulation_time)
-                right_consumption = calculate_consumption("boys", current_break, simulation_time)
+            try:
+                # Advance simulation time or use current time
+                simulation_time = datetime.datetime.now(IST)
+                update_counter += 1
+                health_check_counter += 1
                 
-                # Update tank levels
-                left_tank_level = max(min(left_tank_level - left_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
-                right_tank_level = max(min(right_tank_level - right_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
-            
-            # Calculate volumes
-            left_volume = calculate_volume(left_tank_level)
-            right_volume = calculate_volume(right_tank_level)
-            
-            # Format timestamp to match exact ISO format
-            timestamp = simulation_time.isoformat()
-            
-            # Publish data to MQTT topics
-            client.publish(topic1, round(left_tank_level, 2))
-            client.publish(topic2, round(left_volume, 2))
-            client.publish(topic3, round(right_tank_level, 2))
-            client.publish(topic4, round(right_volume, 2))
-            client.publish(topic5, timestamp)
-            
-            # Print status information
-            print("\n" + "="*50)
-            print(f"Time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(simulation_time) else 'Weekend'}")
-            print(f"Current period: {current_break}")
-            print(f"Usage %: Girls {current_usage_variations[current_break]['girls']:.2f}%, Boys {current_usage_variations[current_break]['boys']:.2f}%")
-            
-            # Calculate consumption in milliliters for display
-            if not is_refilling:
-                left_consumption_ml = left_consumption * TANK_AREA_CM2 / 1000
-                right_consumption_ml = right_consumption * TANK_AREA_CM2 / 1000
-                print(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L, Last change: {left_consumption_ml:.0f} ml")
-                print(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L, Last change: {right_consumption_ml:.0f} ml")
-            else:
-                print(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L (Refilling)")
-                print(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L (Refilling)")
-            
-            print("Data Published!")
-            print("="*50)
-            
-            time.sleep(180)  # Sleep for 3 seconds to simulate 3 minutes in accelerated time
+                # Periodic health check logging (every hour)
+                if health_check_counter >= 20:  # 20 x 3 minutes = 1 hour
+                    logger.info("Health check: Tank monitoring simulation running normally")
+                    health_check_counter = 0
+                
+                # Check if we've moved to a new day
+                if simulation_time.day != last_day:
+                    last_day = simulation_time.day
+                    logger.info(f"New day: {simulation_time.strftime('%Y-%m-%d')}")
+                
+                # Get current break period
+                current_break = get_current_break_period(simulation_time)
+                
+                # Update all usage variations every 3 minutes
+                update_all_usage_variations()
+                
+                # Log significant variation changes every few updates to avoid cluttering
+                if update_counter % 5 == 0:
+                    logger.info("Updated usage variations:")
+                    for period, genders in current_usage_variations.items():
+                        logger.info(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
+                
+                # Handle shared refill for both tanks
+                is_refilling = check_and_handle_refill(simulation_time)
+                
+                if not is_refilling:
+                    # If not refilling, calculate consumption for both tanks
+                    try:
+                        left_consumption = calculate_consumption("girls", current_break, simulation_time)
+                        right_consumption = calculate_consumption("boys", current_break, simulation_time)
+                        
+                        # Update tank levels
+                        left_tank_level = max(min(left_tank_level - left_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
+                        right_tank_level = max(min(right_tank_level - right_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
+                    except Exception as e:
+                        logger.error(f"Error calculating consumption: {str(e)}")
+                        status_data["error"] = f"Calculation error: {str(e)}"
+                        # Continue with existing levels if there's an error
+                
+                # Calculate volumes
+                left_volume = calculate_volume(left_tank_level)
+                right_volume = calculate_volume(right_tank_level)
+                
+                # Format timestamp to match exact ISO format
+                timestamp = simulation_time.isoformat()
+                
+                # Update status data for web interface
+                status_data["last_update"] = timestamp
+                
+                # Check if client is connected before publishing
+                if connected and not client.is_connected():
+                    logger.warning("MQTT client disconnected. Attempting to reconnect...")
+                    status_data["mqtt_connected"] = False
+                    try:
+                        client.reconnect()
+                        status_data["mqtt_connected"] = True
+                    except Exception as e:
+                        logger.error(f"Failed to reconnect: {str(e)}")
+                        status_data["error"] = f"MQTT reconnection failed: {str(e)}"
+                        # Continue and try again next loop
+                
+                # Publish data to MQTT topics with error handling
+                if connected:
+                    try:
+                        # Publish rounded values to reduce data size
+                        client.publish(topic1, round(left_tank_level, 2))
+                        client.publish(topic2, round(left_volume, 2))
+                        client.publish(topic3, round(right_tank_level, 2))
+                        client.publish(topic4, round(right_volume, 2))
+                        client.publish(topic5, timestamp)
+                        
+                        # Status information (only log details every few updates)
+                        if update_counter % 10 == 0:
+                            logger.info("=" * 40)
+                            logger.info(f"Time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(simulation_time) else 'Weekend'}")
+                            logger.info(f"Current period: {current_break}")
+                            logger.info(f"Usage %: Girls {current_usage_variations[current_break]['girls']:.2f}%, Boys {current_usage_variations[current_break]['boys']:.2f}%")
+                            
+                            # Calculate consumption in milliliters for display
+                            if not is_refilling:
+                                left_consumption_ml = left_consumption * TANK_AREA_CM2 / 1000
+                                right_consumption_ml = right_consumption * TANK_AREA_CM2 / 1000
+                                logger.info(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L, Last change: {left_consumption_ml:.0f} ml")
+                                logger.info(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L, Last change: {right_consumption_ml:.0f} ml")
+                            else:
+                                logger.info(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L (Refilling)")
+                                logger.info(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L (Refilling)")
+                            
+                            logger.info("Data Published!")
+                            logger.info("=" * 40)
+                    except Exception as e:
+                        logger.error(f"Failed to publish MQTT messages: {str(e)}")
+                        status_data["error"] = f"MQTT publish error: {str(e)}"
+                
+                # Sleep for 3 minutes (180 seconds) between updates
+                time.sleep(180)
+                
+            except Exception as e:
+                logger.error(f"Error in main loop: {str(e)}")
+                status_data["error"] = f"Main loop error: {str(e)}"
+                # Continue the loop instead of crashing
+                time.sleep(10)  # Brief pause before continuing
 
     except KeyboardInterrupt:
-        print("Stopping the simulation...")
-        # Publish online status before disconnecting
-        client.publish(lwt_topic, "Manually Disconnected", qos=1, retain=True)
-        client.disconnect()
-        client.loop_stop()
-        print("Simulation stopped.")
+        logger.info("Keyboard interrupt received. Stopping the simulation...")
+    except Exception as e:
+        logger.critical(f"Fatal error: {str(e)}")
+        status_data["status"] = "error"
+        status_data["error"] = f"Fatal error: {str(e)}"
+    finally:
+        # Always clean up properly
+        try:
+            # Publish online status before disconnecting
+            if connected:
+                client.publish(lwt_topic, "Manually Disconnected", qos=1, retain=True)
+                client.disconnect()
+                client.loop_stop()
+            logger.info("Simulation stopped and cleaned up.")
+            status_data["status"] = "stopped"
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
 
 if __name__ == "__main__":
     main()
