@@ -1,2 +1,2 @@
-paho-mqtt==2.2.1
+paho-mqtt==2.2.0
 pytz>=2023.3
