@@ -6,51 +6,49 @@ import pytz
 import ssl
 import argparse
 import os
-import logging
-import sys
-from logging.handlers import RotatingFileHandler
 import threading
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import json
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        RotatingFileHandler("tank_monitor.log", maxBytes=10485760, backupCount=5),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("tank_monitor")
-
-# MQTT Configuration from environment variables
-MQTT_BROKER = os.environ.get("MQTT_BROKER", "f449892e7b6e4850ae929bf1e722fef1.s1.eu.hivemq.cloud")
-MQTT_PORT = int(os.environ.get("MQTT_PORT", 8883))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME", "maadunson128")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD", "Ipradeep@1")
+# MQTT Configuration
+MQTT_BROKER = os.environ.get("MQTT_BROKER")
+MQTT_PORT = int(os.environ.get("MQTT_PORT"))
+MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
+MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
 
 # MQTT Topics
-topic1 = os.environ.get("TOPIC1", "tank/topic1")  # Left Tank (Girls) level (cm)
-topic2 = os.environ.get("TOPIC2", "tank/topic2")  # Left Tank (Girls) volume (liters)
-topic3 = os.environ.get("TOPIC3", "tank/topic3")  # Right Tank (Boys) level (cm)
-topic4 = os.environ.get("TOPIC4", "tank/topic4")  # Right Tank (Boys) volume (liters)
-topic5 = os.environ.get("TOPIC5", "tank/topic5")  # Timestamp (IST)
-lwt_topic = os.environ.get("LWT_TOPIC", "tank/status")  # LWT topic
-lwt_message = os.environ.get("LWT_MESSAGE", "Offline")  # LWT message
+topic1 = "tank/topic1"  # Left Tank (Girls) level (cm)
+topic2 = "tank/topic2"  # Left Tank (Girls) volume (liters)
+topic3 = "tank/topic3"  # Right Tank (Boys) level (cm)
+topic4 = "tank/topic4"  # Right Tank (Boys) volume (liters)
+topic5 = "tank/topic5"  # Timestamp (IST)
+lwt_topic = "tank/status"  # LWT topic
+lwt_message = "Offline"  # LWT message
+HEARTBEAT_TOPIC = "tank/heartbeat"  # Heartbeat topic
+
+# Missing connection configuration variables
+HEARTBEAT_INTERVAL = 60  # Send heartbeat every 60 seconds
+RECONNECT_BASE_DELAY = 5  # Initial reconnect delay in seconds
+RECONNECT_MAX_DELAY = 300  # Maximum reconnect delay in seconds (5 minutes)
+
+# Connection status tracking variables
+mqtt_client_connected = False
+last_message_time = time.time()
+current_reconnect_delay = RECONNECT_BASE_DELAY
+last_successful_connection = 0
 
 # Tank Properties
-TANK_AREA_CM2 = float(os.environ.get("TANK_AREA_CM2", 91628.57))  # Cross-sectional area of both tanks (cm²)
-MAX_LEVEL_CM = float(os.environ.get("MAX_LEVEL_CM", 140))  # Max water level (cm)
-MIN_LEVEL_CM = float(os.environ.get("MIN_LEVEL_CM", 2))    # Min water level (cm)
-REFILL_DURATION = int(os.environ.get("REFILL_DURATION", 55))   # Minutes to refill both tanks
+TANK_AREA_CM2 = 91628.57  # Cross-sectional area of both tanks (cm²)
+MAX_LEVEL_CM = 140  # Max water level (cm)
+MIN_LEVEL_CM = 2    # Min water level (cm)
+REFILL_DURATION = 55   # Minutes to refill both tanks (1 hour)
 
 # Initial simulation time (will be set from command line or default to current time)
 simulation_time = None
 
 # Initial Water Levels
-left_tank_level = float(os.environ.get("INITIAL_LEFT_LEVEL", 80))  # Girls tank starting level
-right_tank_level = float(os.environ.get("INITIAL_RIGHT_LEVEL", 75))  # Boys tank starting level
+left_tank_level = 80  # Girls tank starting level
+right_tank_level = 75  # Boys tank starting level
 
 # Shared refill state tracking for both tanks
 tanks_refilling = False
@@ -110,69 +108,104 @@ WATER_PER_USE = {
 # IST Timezone
 IST = pytz.timezone("Asia/Kolkata")
 
-# Web server status data - updated by the main process
-status_data = {
-    "status": "starting",
-    "last_update": None,
-    "mqtt_connected": False,
-    "error": None
-}
-
-# HTTP Handler for web interface
-class StatusHandler(BaseHTTPRequestHandler):
+# ===== HTTP Server for Health Checks =====
+class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global left_tank_level, right_tank_level, simulation_time, tanks_refilling
+        self.send_response(200)
+        self.send_header('Content-type', 'text/html')
+        self.end_headers()
+        status = "Connected" if mqtt_client_connected else "Disconnected"
+        self.wfile.write(f"Tank Simulation is running (Status: {status})".encode())
         
-        if self.path == '/health' or self.path == '/':
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            
-            # Create status report
-            status = {
-                "status": status_data["status"],
-                "timestamp": datetime.datetime.now(IST).isoformat(),
-                "simulation_time": simulation_time.isoformat() if simulation_time else None,
-                "mqtt_connected": status_data["mqtt_connected"],
-                "last_update": status_data["last_update"],
-                "tanks": {
-                    "left": {
-                        "level_cm": round(left_tank_level, 2),
-                        "volume_liters": round(calculate_volume(left_tank_level), 2)
-                    },
-                    "right": {
-                        "level_cm": round(right_tank_level, 2),
-                        "volume_liters": round(calculate_volume(right_tank_level), 2)
-                    }
-                },
-                "refilling": tanks_refilling,
-                "current_period": get_current_break_period(datetime.datetime.now(IST)),
-                "render_deployment_time": "2025-04-02 17:16:10"
-            }
-            
-            # Add any error information
-            if status_data["error"]:
-                status["error"] = status_data["error"]
-            
-            self.wfile.write(json.dumps(status, indent=2).encode())
-        else:
-            self.send_response(404)
-            self.send_header('Content-type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(b'Not Found')
-    
     def log_message(self, format, *args):
-        # Redirect server logs to our logger
-        if args[1] != '/health':  # Don't log health check requests to reduce noise
-            logger.info(f"HTTP: {args[0]} {args[1]} {args[2]}")
+        # Suppress logs from HTTP requests to avoid cluttering the console
+        return
 
-def start_web_server():
-    """Start the web server in a separate thread."""
-    port = int(os.environ.get('PORT', 10000))
-    server = HTTPServer(('0.0.0.0', port), StatusHandler)
-    logger.info(f"Starting web server on port {port}")
+def start_health_server():
+    port = int(os.environ.get('PORT', 8080))  # Render assigns a PORT env variable
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"Starting health check server on port {port}")
     server.serve_forever()
 
+# ===== MQTT Connection Functions =====
+def heartbeat_check():
+    """Function to periodically check connection health and send heartbeats"""
+    global last_message_time
+    
+    while True:
+        current_time = time.time()
+        time_since_last_message = current_time - last_message_time
+        
+        # Check if we've received any message recently
+        if time_since_last_message > HEARTBEAT_INTERVAL * 2:
+            print(f"WARNING: No messages or activity for {time_since_last_message:.1f} seconds")
+        
+        # Send a heartbeat if connected, otherwise try to reconnect
+        if mqtt_client_connected:
+            try:
+                timestamp = datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+                client.publish(HEARTBEAT_TOPIC, f"HEARTBEAT: {timestamp}")
+                print(f"Heartbeat sent at {timestamp}")
+            except Exception as e:
+                print(f"Error sending heartbeat: {e}")
+                # Try to reconnect
+                reconnect()
+        else:
+            print("Not connected to MQTT broker during heartbeat check, attempting to reconnect...")
+            reconnect()
+        
+        # Sleep until next heartbeat
+        time.sleep(HEARTBEAT_INTERVAL)
+
+def reconnect():
+    """Attempt to reconnect with exponential backoff"""
+    global current_reconnect_delay, mqtt_client_connected
+    
+    if mqtt_client_connected:
+        print("Reconnect called while already connected. Skipping.")
+        return
+    
+    print(f"Attempting to reconnect in {current_reconnect_delay} seconds...")
+    time.sleep(current_reconnect_delay)
+    
+    try:
+        client.reconnect()
+        print("Reconnection successful")
+        # Reset the reconnect delay on successful connection
+        current_reconnect_delay = RECONNECT_BASE_DELAY
+    except Exception as e:
+        print(f"Reconnection failed: {e}")
+        # Increase the delay for next attempt (exponential backoff)
+        current_reconnect_delay = min(current_reconnect_delay * 2, RECONNECT_MAX_DELAY)
+        # Schedule another reconnect attempt
+        threading.Timer(current_reconnect_delay, reconnect).start()
+
+def on_connect(client, userdata, flags, reason_code, properties):
+    global mqtt_client_connected, last_successful_connection, current_reconnect_delay
+    
+    if reason_code == 0:
+        mqtt_client_connected = True
+        last_successful_connection = time.time()
+        current_reconnect_delay = RECONNECT_BASE_DELAY  # Reset backoff on successful connection
+        print(f"Connected to MQTT broker successfully at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        mqtt_client_connected = False
+        print(f"Failed to connect to MQTT broker. Return code: {reason_code}")
+        # Schedule a reconnection attempt
+        threading.Timer(current_reconnect_delay, reconnect).start()
+
+def on_disconnect(client, userdata, reason_code, properties):
+    global mqtt_client_connected
+    
+    mqtt_client_connected = False
+    print(f"Disconnected from MQTT broker with code {reason_code} at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    if reason_code != 0:
+        print("Unexpected disconnection, scheduling reconnect...")
+        # Schedule a reconnection attempt
+        threading.Timer(current_reconnect_delay, reconnect).start()
+
+# ===== Tank Simulation Functions =====
 def calculate_volume(level_cm):
     """Calculate water volume in liters."""
     volume_cm3 = TANK_AREA_CM2 * level_cm
@@ -373,7 +406,7 @@ def calculate_consumption(tank_type, current_break, current_time):
         return level_change * (3 / 180)  # 180 minute period
     else:
         return level_change  # Already scaled for regular periods
-    
+
 def check_and_handle_refill(current_time):
     """Handle shared refill logic for both tanks."""
     global tanks_refilling, refill_start_time, last_refill_day
@@ -384,7 +417,7 @@ def check_and_handle_refill(current_time):
     time_in_minutes = hour * 60 + minute
     current_day = current_time.date()
     
-    # Refill timing window: 9:00 AM to 9:40 AM on weekdays (Monday-Friday)
+    # Refill timing window: 9:00 AM to 9:20 AM on weekdays (Monday-Friday)
     refill_window = (9*60 <= time_in_minutes < 9*60+20) and is_weekday(current_time)
     
     if not tanks_refilling:
@@ -392,9 +425,9 @@ def check_and_handle_refill(current_time):
         if refill_window and last_refill_day != current_day:
             # Randomly decide if we start refill now - creates variation in start times within window
             if random.random() < 0.3:  # 30% chance to start if conditions are met
-                logger.info(f"Starting simultaneous refill for both tanks at {current_time.strftime('%H:%M:%S')}")
-                logger.info(f"Left Tank starting level: {left_tank_level:.2f} cm")
-                logger.info(f"Right Tank starting level: {right_tank_level:.2f} cm")
+                print(f"Starting simultaneous refill for both tanks at {current_time.strftime('%H:%M:%S')}")
+                print(f"Left Tank starting level: {left_tank_level:.2f} cm")
+                print(f"Right Tank starting level: {right_tank_level:.2f} cm")
                 
                 # Save start levels for both tanks
                 left_refill_start_level = left_tank_level
@@ -415,7 +448,7 @@ def check_and_handle_refill(current_time):
         
         if elapsed_minutes >= REFILL_DURATION:
             # Refill completed
-            logger.info(f"Refill completed for both tanks at {current_time.strftime('%H:%M:%S')}")
+            print(f"Refill completed for both tanks at {current_time.strftime('%H:%M:%S')}")
             tanks_refilling = False
             refill_start_time = None
             return False
@@ -434,270 +467,190 @@ def check_and_handle_refill(current_time):
         right_level_increase = right_level_increase * shared_random_factor
         right_tank_level = min(right_refill_start_level + right_level_increase, MAX_LEVEL_CM)
         
-        # Log status occasionally to avoid cluttering the output
+        # Print status occasionally to avoid cluttering the output
         if int(elapsed_minutes) % 10 == 0 and int(elapsed_minutes) > 0:
-            logger.info(f"Both tanks refilling: {int(elapsed_minutes)}/{REFILL_DURATION} minutes")
-            logger.info(f"Left Tank level: {left_tank_level:.2f} cm")
-            logger.info(f"Right Tank level: {right_tank_level:.2f} cm")
+            print(f"Both tanks refilling: {int(elapsed_minutes)}/{REFILL_DURATION} minutes")
+            print(f"Left Tank level: {left_tank_level:.2f} cm")
+            print(f"Right Tank level: {right_tank_level:.2f} cm")
         
         return True
 
-def on_connect(client, userdata, flags, reason_code, properties):
-    global status_data
-    if reason_code == 0:
-        logger.info("Connected to MQTT Broker!")
-        status_data["mqtt_connected"] = True
-        # Publish online status
-        try:
-            client.publish(lwt_topic, "Online", qos=1, retain=True)
-        except Exception as e:
-            logger.error(f"Failed to publish online status: {str(e)}")
-    else:
-        logger.error(f"Failed to connect, return code {reason_code}")
-        status_data["mqtt_connected"] = False
-        status_data["error"] = f"MQTT connection failed with code {reason_code}"
-        # The client will auto-reconnect by default
-
-def on_disconnect(client, userdata, rc, properties):
-    global status_data
-    status_data["mqtt_connected"] = False
-    logger.warning(f"Disconnected with result code {rc}")
-    if rc != 0:
-        logger.info("Unexpected disconnect. Reconnection will be handled automatically.")
-
-def on_publish(client, userdata, mid, properties):
-    # Optionally track successful publishes
-    pass
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Water Tank Monitoring Simulation")
-    parser.add_argument("--start-time", type=str, default=None,
-                       help="Starting simulation time in UTC (YYYY-MM-DD HH:MM:SS). If not provided, current time will be used.")
-    return parser.parse_args()
-
-def main():
-    global simulation_time, left_tank_level, right_tank_level, status_data
+# ===== Tank Simulation Main Function =====
+def run_tank_simulation():
+    """Main function to run the tank simulation and publish data"""
+    global left_tank_level, right_tank_level, last_message_time
     
-    # Update status
-    status_data["status"] = "initializing"
-    
-    # Parse command line arguments
-    args = parse_args()
-    
-    # Set simulation time
-    if args.start_time is not None:
-        try:
-            utc_time = datetime.datetime.strptime(args.start_time, "%Y-%m-%d %H:%M:%S")
-            simulation_time = pytz.utc.localize(utc_time).astimezone(IST)
-            logger.info(f"Starting simulation at: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
-        except ValueError:
-            logger.warning(f"Invalid time format. Using current time.")
-            simulation_time = datetime.datetime.now(IST)
-    else:
-        # Use current time in IST
-        simulation_time = datetime.datetime.now(IST)
-        logger.info(f"Starting simulation at current time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} IST")
-    
-    # Start web server in a separate thread
-    web_thread = threading.Thread(target=start_web_server, daemon=True)
-    web_thread.start()
-    logger.info("Web server thread started")
-    
-    # Set up MQTT client with VERSION2 API and random client ID to avoid connection conflicts
-    client_id = f"ESP32_TankMonitor_{random.randint(1000, 9999)}"
-    client = mqtt.Client(client_id=client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-
-    # Use system certificates
-    client.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED)
-
-    # Last Will and Testament (LWT)
-    client.will_set(lwt_topic, lwt_message, qos=1, retain=True)
-
-    # Set callbacks
-    client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
-    client.on_publish = on_publish
-
-    # Connect to MQTT broker with retry logic
-    connected = False
-    retry_count = 0
-    max_retries = 10
-    
-    while not connected and retry_count < max_retries:
-        try:
-            logger.info(f"Attempting to connect to MQTT broker (attempt {retry_count+1})")
-            client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            connected = True
-            status_data["mqtt_connected"] = True
-            logger.info(f"Successfully connected to MQTT broker with client ID: {client_id}")
-        except Exception as e:
-            retry_count += 1
-            status_data["error"] = f"MQTT connection attempt {retry_count} failed: {str(e)}"
-            logger.error(f"Connection attempt {retry_count} failed: {str(e)}")
-            if retry_count < max_retries:
-                wait_time = min(30, 2 ** retry_count)  # Exponential backoff
-                logger.info(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
-    
-    if not connected:
-        status_data["status"] = "error"
-        status_data["error"] = "Failed to connect to MQTT broker after maximum retries"
-        logger.critical("Failed to connect after maximum retries. Will continue running for web interface.")
-    else:
-        status_data["status"] = "connected"
-
-    # Start the client loop in the background
-    client.loop_start()
+    print("Starting Tank Simulation...")
+    print(f"Current time: {datetime.datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Initialize usage variations for all periods
     update_all_usage_variations()
     
-    # Start simulation
-    try:
-        logger.info("Starting realistic tank monitoring simulation")
-        logger.info(f"Current time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(simulation_time) else 'Weekend'}")
-        
-        # Show initial usage variations for all periods
-        logger.info("Initial usage variations:")
-        for period, genders in current_usage_variations.items():
-            logger.info(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
-        
-        last_day = simulation_time.day
-        update_counter = 0
-        health_check_counter = 0
-        
-        # Update status
-        status_data["status"] = "running"
-        
-        while True:
-            try:
-                # Advance simulation time or use current time
-                simulation_time = datetime.datetime.now(IST)
-                update_counter += 1
-                health_check_counter += 1
-                
-                # Periodic health check logging (every hour)
-                if health_check_counter >= 20:  # 20 x 3 minutes = 1 hour
-                    logger.info("Health check: Tank monitoring simulation running normally")
-                    health_check_counter = 0
-                
-                # Check if we've moved to a new day
-                if simulation_time.day != last_day:
-                    last_day = simulation_time.day
-                    logger.info(f"New day: {simulation_time.strftime('%Y-%m-%d')}")
-                
-                # Get current break period
-                current_break = get_current_break_period(simulation_time)
-                
-                # Update all usage variations every 3 minutes
-                update_all_usage_variations()
-                
-                # Log significant variation changes every few updates to avoid cluttering
-                if update_counter % 5 == 0:
-                    logger.info("Updated usage variations:")
-                    for period, genders in current_usage_variations.items():
-                        logger.info(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
-                
-                # Handle shared refill for both tanks
-                is_refilling = check_and_handle_refill(simulation_time)
-                
-                if not is_refilling:
-                    # If not refilling, calculate consumption for both tanks
-                    try:
-                        left_consumption = calculate_consumption("girls", current_break, simulation_time)
-                        right_consumption = calculate_consumption("boys", current_break, simulation_time)
-                        
-                        # Update tank levels
-                        left_tank_level = max(min(left_tank_level - left_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
-                        right_tank_level = max(min(right_tank_level - right_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
-                    except Exception as e:
-                        logger.error(f"Error calculating consumption: {str(e)}")
-                        status_data["error"] = f"Calculation error: {str(e)}"
-                        # Continue with existing levels if there's an error
-                
-                # Calculate volumes
-                left_volume = calculate_volume(left_tank_level)
-                right_volume = calculate_volume(right_tank_level)
-                
-                # Format timestamp to match exact ISO format
-                timestamp = simulation_time.isoformat()
-                
-                # Update status data for web interface
-                status_data["last_update"] = timestamp
-                
-                # Check if client is connected before publishing
-                if connected and not client.is_connected():
-                    logger.warning("MQTT client disconnected. Attempting to reconnect...")
-                    status_data["mqtt_connected"] = False
-                    try:
-                        client.reconnect()
-                        status_data["mqtt_connected"] = True
-                    except Exception as e:
-                        logger.error(f"Failed to reconnect: {str(e)}")
-                        status_data["error"] = f"MQTT reconnection failed: {str(e)}"
-                        # Continue and try again next loop
-                
-                # Publish data to MQTT topics with error handling
-                if connected:
-                    try:
-                        # Publish rounded values to reduce data size
-                        client.publish(topic1, round(left_tank_level, 2))
-                        client.publish(topic2, round(left_volume, 2))
-                        client.publish(topic3, round(right_tank_level, 2))
-                        client.publish(topic4, round(right_volume, 2))
-                        client.publish(topic5, timestamp)
-                        
-                        # Status information (only log details every few updates)
-                        if update_counter % 10 == 0:
-                            logger.info("=" * 40)
-                            logger.info(f"Time: {simulation_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(simulation_time) else 'Weekend'}")
-                            logger.info(f"Current period: {current_break}")
-                            logger.info(f"Usage %: Girls {current_usage_variations[current_break]['girls']:.2f}%, Boys {current_usage_variations[current_break]['boys']:.2f}%")
-                            
-                            # Calculate consumption in milliliters for display
-                            if not is_refilling:
-                                left_consumption_ml = left_consumption * TANK_AREA_CM2 / 1000
-                                right_consumption_ml = right_consumption * TANK_AREA_CM2 / 1000
-                                logger.info(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L, Last change: {left_consumption_ml:.0f} ml")
-                                logger.info(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L, Last change: {right_consumption_ml:.0f} ml")
-                            else:
-                                logger.info(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L (Refilling)")
-                                logger.info(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L (Refilling)")
-                            
-                            logger.info("Data Published!")
-                            logger.info("=" * 40)
-                    except Exception as e:
-                        logger.error(f"Failed to publish MQTT messages: {str(e)}")
-                        status_data["error"] = f"MQTT publish error: {str(e)}"
-                
-                # Sleep for 3 minutes (180 seconds) between updates
-                time.sleep(180)
-                
-            except Exception as e:
-                logger.error(f"Error in main loop: {str(e)}")
-                status_data["error"] = f"Main loop error: {str(e)}"
-                # Continue the loop instead of crashing
-                time.sleep(10)  # Brief pause before continuing
-
-    except KeyboardInterrupt:
-        logger.info("Keyboard interrupt received. Stopping the simulation...")
-    except Exception as e:
-        logger.critical(f"Fatal error: {str(e)}")
-        status_data["status"] = "error"
-        status_data["error"] = f"Fatal error: {str(e)}"
-    finally:
-        # Always clean up properly
+    last_day = datetime.datetime.now(IST).day
+    update_counter = 0
+    
+    while True:
         try:
-            # Publish online status before disconnecting
-            if connected:
-                client.publish(lwt_topic, "Manually Disconnected", qos=1, retain=True)
-                client.disconnect()
-                client.loop_stop()
-            logger.info("Simulation stopped and cleaned up.")
-            status_data["status"] = "stopped"
+            # Get current time in IST
+            current_time = datetime.datetime.now(IST)
+            update_counter += 1
+            
+            # Update last message time to show activity
+            last_message_time = time.time()
+            
+            # Check if we've moved to a new day
+            if current_time.day != last_day:
+                last_day = current_time.day
+                print(f"\nNew day: {current_time.strftime('%Y-%m-%d')}")
+            
+            # Get current break period
+            current_break = get_current_break_period(current_time)
+            
+            # Update all usage variations every 3 minutes
+            update_all_usage_variations()
+            
+            # Print variation changes occasionally to avoid cluttering
+            if update_counter % 5 == 0:
+                print("\nUpdated usage variations:")
+                for period, genders in current_usage_variations.items():
+                    if period == current_break:
+                        print(f"  *{period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
+                    else:
+                        print(f"  {period}: Girls {genders['girls']:.2f}%, Boys {genders['boys']:.2f}%")
+            
+            # Handle shared refill for both tanks
+            is_refilling = check_and_handle_refill(current_time)
+            
+            if not is_refilling:
+                # If not refilling, calculate consumption for both tanks
+                left_consumption = calculate_consumption("girls", current_break, current_time)
+                right_consumption = calculate_consumption("boys", current_break, current_time)
+                
+                # Update tank levels
+                left_tank_level = max(min(left_tank_level - left_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
+                right_tank_level = max(min(right_tank_level - right_consumption, MAX_LEVEL_CM), MIN_LEVEL_CM)
+            
+            # Calculate volumes
+            left_volume = calculate_volume(left_tank_level)
+            right_volume = calculate_volume(right_tank_level)
+            
+            # Format timestamp to match exact ISO format
+            timestamp = current_time.isoformat()
+            
+            # Only publish if connected
+            if mqtt_client_connected:
+                # Publish data to MQTT topics
+                client.publish(topic1, round(left_tank_level, 2))
+                client.publish(topic2, round(left_volume, 2))
+                client.publish(topic3, round(right_tank_level, 2))
+                client.publish(topic4, round(right_volume, 2))
+                client.publish(topic5, timestamp)
+                
+                # Print status information
+                print("\n" + "="*50)
+                print(f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')} {'Weekday' if is_weekday(current_time) else 'Weekend'}")
+                print(f"Current period: {current_break}")
+                print(f"Usage %: Girls {current_usage_variations[current_break]['girls']:.2f}%, Boys {current_usage_variations[current_break]['boys']:.2f}%")
+                
+                # Calculate consumption in milliliters for display
+                if not is_refilling:
+                    left_consumption_ml = left_consumption * TANK_AREA_CM2 / 1000
+                    right_consumption_ml = right_consumption * TANK_AREA_CM2 / 1000
+                    print(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L, Last change: {left_consumption_ml:.0f} ml")
+                    print(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L, Last change: {right_consumption_ml:.0f} ml")
+                else:
+                    print(f"Left Tank (Girls) - Level: {left_tank_level:.2f} cm, Volume: {left_volume:.2f} L (Refilling)")
+                    print(f"Right Tank (Boys) - Level: {right_tank_level:.2f} cm, Volume: {right_volume:.2f} L (Refilling)")
+                
+                print("Data Published!")
+                print("="*50)
+            else:
+                print(f"Not connected to MQTT broker. Tank levels - Left: {left_tank_level:.2f} cm, Right: {right_tank_level:.2f} cm")
+            
+            # Sleep for 3 minutes (180 seconds)
+            time.sleep(180)
+        
         except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
+            print(f"Error in simulation loop: {e}")
+            # Continue the loop even if there's an error
+            time.sleep(30)
 
-if __name__ == "__main__":
-    main()
+# ===== Main Execution =====
+try:
+    # Create an MQTT client instance with VERSION2 API
+    client = mqtt.Client(client_id=f"tank-simulator-{int(time.time())}", callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    
+    # Set the callbacks
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    
+    # Set up authentication
+    client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    
+    # Set Last Will and Testament (LWT)
+    client.will_set(lwt_topic, lwt_message, qos=1, retain=True)
+    
+    # Enable TLS/SSL
+    client.tls_set(certfile=None, keyfile=None, cert_reqs=ssl.CERT_REQUIRED)
+    
+    # Set a longer keepalive interval
+    client.keepalive = 360  # 6 minutes
+    
+    # First, start the health check server for Railway/Render
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    print("Health check server started")
+    
+    # Start heartbeat thread
+    heartbeat_thread = threading.Thread(target=heartbeat_check, daemon=True)
+    heartbeat_thread.start()
+    print(f"Heartbeat monitor started with {HEARTBEAT_INTERVAL} second interval")
+    
+    # Resolve the hostname before connecting
+    try:
+        print(f"Resolving hostname for {MQTT_BROKER}...")
+        ip_address = socket.gethostbyname(MQTT_BROKER)
+        print(f"Resolved to IP: {ip_address}")
+    except Exception as e:
+        print(f"Warning: Could not resolve MQTT broker hostname: {e}")
+    
+    # Connect to MQTT broker
+    print(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
+    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=360)
+    
+    # Start the network loop in a non-blocking way
+    client.loop_start()
+    
+    # Start the tank simulation in a separate thread
+    simulation_thread = threading.Thread(target=run_tank_simulation, daemon=True)
+    simulation_thread.start()
+    
+    # Main program loop
+    print("Tank simulation is running. Press Ctrl+C to exit.")
+    while True:
+        time.sleep(60)
+        # Check connection status periodically in the main thread
+        if not mqtt_client_connected:
+            print("Main loop detected client is not connected")
+            if time.time() - last_successful_connection > 600:  # 10 minutes
+                print("No connection for extended period, forcing new connection attempt...")
+                try:
+                    client.disconnect()
+                except:
+                    pass
+                time.sleep(2)
+                try:
+                    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=360)
+                except Exception as e:
+                    print(f"Reconnection from main loop failed: {e}")
+    
+except KeyboardInterrupt:
+    print("\nProgram terminated by user")
+    client.publish(lwt_topic, "Manually Disconnected", qos=1, retain=True)
+    client.loop_stop()
+    client.disconnect()
+    print("Disconnected from MQTT")
+except Exception as e:
+    print(f"Error: {e}")
+    client.loop_stop()
+    client.disconnect()
