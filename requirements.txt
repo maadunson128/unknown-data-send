@@ -1,2 +1,2 @@
-paho-mqtt==2.1.0
-pytz>=2023.3
+paho-mqtt==2.2.1
+pytz>=2021.1

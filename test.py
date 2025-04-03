@@ -180,7 +180,7 @@ def reconnect():
         # Schedule another reconnect attempt
         threading.Timer(current_reconnect_delay, reconnect).start()
 
-def on_connect(client, userdata, flags, reason_code, properties):
+def on_connect(client, userdata, flags, reason_code, properties=None):
     global mqtt_client_connected, last_successful_connection, current_reconnect_delay
     
     if reason_code == 0:
@@ -194,7 +194,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
         # Schedule a reconnection attempt
         threading.Timer(current_reconnect_delay, reconnect).start()
 
-def on_disconnect(client, userdata, reason_code, properties):
+def on_disconnect(client, userdata, reason_code, properties=None, mid=None):
     global mqtt_client_connected
     
     mqtt_client_connected = False
