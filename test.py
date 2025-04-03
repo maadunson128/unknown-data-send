@@ -83,8 +83,8 @@ USAGE_PERCENT_RANGES = {
         "boys": {"min": 0.8, "max": 1.2, "center": 1.0}
     },
     "regular": {
-        "girls": {"min": 0.1, "max": 8.0, "center": 2.5},
-        "boys": {"min": 0.1, "max": 7.5, "center": 2.9}
+        "girls": {"min": 0.1, "max": 1, "center": 0.5},
+        "boys": {"min": 0.1, "max": 1.2, "center": 0.6}
     },
     "night_time": {
         "girls": {"min": 0.90, "max": 2.2, "center": 1.5},
