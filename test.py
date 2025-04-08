@@ -47,8 +47,8 @@ REFILL_DURATION = 55   # Minutes to refill both tanks (1 hour)
 simulation_time = None
 
 # Initial Water Levels
-left_tank_level = 110  # Girls tank starting level
-right_tank_level = 98 # Boys tank starting level
+left_tank_level = 99  # Girls tank starting level
+right_tank_level = 67 # Boys tank starting level
 
 # Shared refill state tracking for both tanks
 tanks_refilling = False
