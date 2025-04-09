@@ -47,8 +47,8 @@ REFILL_DURATION = 55   # Minutes to refill both tanks (1 hour)
 simulation_time = None
 
 # Initial Water Levels
-left_tank_level = 103  # Girls tank starting level
-right_tank_level = 42 # Boys tank starting level
+left_tank_level = 97.5  # Girls tank starting level
+right_tank_level = 37.0 # Boys tank starting level
 
 # Shared refill state tracking for both tanks
 tanks_refilling = False
@@ -71,8 +71,8 @@ USAGE_PERCENT_RANGES = {
         "boys": {"min": 40.0, "max": 55.0, "center": 50.0}
     },
     "lunch_break": {
-        "girls": {"min": 65.0, "max": 75.0, "center": 67.0},
-        "boys": {"min": 70.0, "max": 77.0, "center": 70.0}
+        "girls": {"min": 35.0, "max": 50.0, "center": 47.5},
+        "boys": {"min": 40.0, "max": 55.0, "center": 47.0}
     },
     "evening_break": {
         "girls": {"min": 55.0, "max": 65.0, "center": 50.0},
@@ -83,8 +83,8 @@ USAGE_PERCENT_RANGES = {
         "boys": {"min": 0.8, "max": 1.2, "center": 1.0}
     },
     "regular": {
-        "girls": {"min": 0.1, "max": 1, "center": 0.5},
-        "boys": {"min": 0.1, "max": 1.2, "center": 0.6}
+        "girls": {"min": 0.1, "max": 0.8, "center": 0.38},
+        "boys": {"min": 0.1, "max": 0.6, "center": 0.25}
     },
     "night_time": {
         "girls": {"min": 0.90, "max": 2.2, "center": 1.5},
